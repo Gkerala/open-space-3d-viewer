@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>공개 공간 3D 뷰어</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0f14;color:#e2e8f0;overflow:hidden;
+    font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR",sans-serif}
+  #c{display:block;width:100%;height:100%;touch-action:none}
+  .panel{position:fixed;background:rgba(11,15,20,.9);border:1px solid #1e293b;border-radius:12px;
+    padding:10px 12px;font-size:12.5px;line-height:1.6;max-width:calc(100vw - 24px);box-sizing:border-box}
+  #hud{left:12px;top:12px;width:300px}
+  #hud h1{margin:0 0 4px;font-size:14px;color:#7dd3fc}
+  #steps{margin:0;padding:0;list-style:none}
+  #steps li{color:#64748b}
+  #steps li::before{content:"·  "}
+  #steps li.run::before{content:"…  ";color:#eab308}
+  #steps li.ok{color:#86efac} #steps li.ok::before{content:"OK ";color:#22c55e;font-weight:700}
+  #steps li.bad{color:#fca5a5} #steps li.bad::before{content:"X  ";color:#ef4444;font-weight:700}
+  #stats{margin-top:6px;color:#cbd5e1;font-variant-numeric:tabular-nums}
+  #err{display:none;margin-top:8px;padding:8px;border-radius:8px;background:#2a1215;border:1px solid #7f1d1d;color:#fecaca;white-space:pre-wrap}
+  #ctl{right:12px;top:12px;text-align:right}
+  button{background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer;margin:2px}
+  button:hover,button:focus-visible{background:#334155;outline:none}
+  button.on{background:#0369a1;border-color:#0ea5e9}
+  #cmp{left:12px;bottom:12px;display:none}
+  #cmp table{border-collapse:collapse;font-variant-numeric:tabular-nums}
+  #cmp th,#cmp td{padding:2px 8px;text-align:right;border-bottom:1px solid #1e293b}
+  #cmp th:first-child,#cmp td:first-child{text-align:left}
+  #drop{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(3,105,161,.35);
+    font-size:18px;border:3px dashed #7dd3fc;pointer-events:none}
+  #drop.show{display:flex}
+  @media (max-width:520px){#hud{width:auto;right:12px}#ctl{top:auto;bottom:12px}#cmp{bottom:64px}}
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="3D 장면"></canvas>
+<div id="drop">.sog / .spz / .ply 파일을 놓으면 비교 표에 추가합니다</div>
+
+<div class="panel" id="hud">
+  <h1>공개 공간 3D 뷰어</h1>
+  <ul id="steps">
+    <li id="s1">라이브러리 불러오기</li>
+    <li id="s2">렌더러 넣기</li>
+    <li id="s3">파일 받기</li>
+    <li id="s4">알갱이로 풀기</li>
+    <li id="s5">크기 재기</li>
+  </ul>
+  <div id="stats"></div>
+  <div id="err" role="alert"></div>
+</div>
+
+<div class="panel" id="ctl">
+  <button id="fit" type="button">화면에 맞추기</button><button id="flip" type="button">위아래 뒤집기</button><br>
+  <button id="spin" type="button" aria-pressed="false">자동 회전</button><button id="pick" type="button">파일 비교</button>
+  <input id="file" type="file" accept=".sog,.spz,.ply,.splat" multiple hidden>
+</div>
+
+<div class="panel" id="cmp" aria-live="polite">
+  <table><thead><tr><th>파일</th><th>바이트</th><th>알갱이</th><th>바이트/알갱이</th><th>풀기(초)</th></tr></thead><tbody id="rows"></tbody></table>
+</div>
+
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+  "@sparkjsdev/spark":"https://sparkjs.dev/releases/spark/2.4.0/spark.module.js"
+}}
+</script>
+<script type="module">
+// ===== 여기만 바꾸면 된다 =====
+const SPLAT_FILE = new URLSearchParams(location.search).get("f") || "scene.sog";
+// ============================
+
+// 확장자 → Spark 형식 이름. .sog는 "pcsogszip"이어야 한다. compressed.ply도 ply로 읽는다.
+const TYPE_OF = { sog: "pcsogszip", spz: "spz", ply: "ply", splat: "splat" };
+const $ = id => document.getElementById(id);
+const mark = (id, cls, text) => { $(id).className = cls; if (text) $(id).textContent = text; };
+const fail = msg => { const e = $("err"); e.style.display = "block"; e.textContent = msg; };
+addEventListener("unhandledrejection", e => fail("처리 못 한 오류: " + (e.reason?.message || e.reason)));
+
+let THREE, OrbitControls, SPARK;
+mark("s1", "run");
+try {
+  THREE = await import("three");
+  ({ OrbitControls } = await import("three/addons/controls/OrbitControls.js"));
+  SPARK = await import("@sparkjsdev/spark");
+  mark("s1", "ok");
+} catch (e) {
+  mark("s1", "bad"); fail("three.js나 Spark를 못 불러왔습니다. 인터넷 연결을 확인하세요.\n" + e.message); throw e;
+}
+
+const renderer = new THREE.WebGLRenderer({ canvas: $("c"), antialias: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0f14);
+const camera = new THREE.PerspectiveCamera(55, 1, 0.01, 1000);
+camera.position.set(2, 1, 2);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+// SparkRenderer를 장면에 넣지 않으면 오류 없이 화면이 검다.
+scene.add(new SPARK.SparkRenderer({ renderer }));
+mark("s2", "ok");
+
+const resize = () => { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); };
+addEventListener("resize", resize); resize();
+
+let mesh = null;
+const kb = n => n.toLocaleString("ko-KR");
+
+async function show(name, bytes) {
+  const ext = name.split(".").pop().toLowerCase();
+  const fileType = TYPE_OF[ext];
+  if (!fileType) throw new Error(`모르는 확장자: .${ext}`);
+  const t0 = performance.now();
+  const next = new SPARK.SplatMesh({ fileBytes: new Uint8Array(bytes), fileType });
+  await next.initialized;
+  const n = next.packedSplats?.numSplats ?? 0;
+  if (!n) throw new Error("알갱이가 0개입니다");
+  if (mesh) { scene.remove(mesh); mesh.dispose?.(); }
+  mesh = next; scene.add(mesh);
+  return { n, sec: (performance.now() - t0) / 1000 };
+}
+
+// 일반 three.js 바깥 상자(Box3.setFromObject)는 SplatMesh에서 빈 상자가 된다 → Spark의 getBoundingBox를 쓴다.
+function fit() {
+  let box = null;
+  try { box = mesh?.getBoundingBox?.(true); } catch (e) { box = null; }
+  if (!box || box.isEmpty()) { mark("s5", "bad", "크기 재기 실패: 화면을 끌어 직접 찾으세요"); return; }
+  const c = box.getCenter(new THREE.Vector3());
+  const r = box.getSize(new THREE.Vector3()).length() * 0.5;
+  controls.target.copy(c);
+  camera.position.copy(c).add(new THREE.Vector3(r * 0.9, r * 0.35, r * 1.1));
+  camera.near = Math.max(r / 1000, 0.001); camera.far = r * 60; camera.updateProjectionMatrix();
+  mark("s5", "ok", `크기 재기: 반지름 ${r.toFixed(2)}`);
+}
+
+function addRow(name, bytes, n, sec) {
+  $("cmp").style.display = "block";
+  const tr = document.createElement("tr");
+  [name, kb(bytes), kb(n), (bytes / n).toFixed(1), sec.toFixed(2)].forEach(v => {
+    const td = document.createElement("td"); td.textContent = v; tr.append(td);
+  });
+  $("rows").append(tr);
+}
+
+// 첫 장면: 같은 폴더의 파일을 받는다.
+mark("s3", "run");
+try {
+  const t0 = performance.now();
+  const r = await fetch(SPLAT_FILE);
+  if (!r.ok) throw new Error(`서버 응답 ${r.status}`);
+  const buf = await r.arrayBuffer();
+  const sec = (performance.now() - t0) / 1000;
+  mark("s3", "ok", `파일 받기: ${SPLAT_FILE} ${(buf.byteLength / 1e6).toFixed(1)}MB, ${sec.toFixed(1)}초`);
+  mark("s4", "run");
+  const { n, sec: dsec } = await show(SPLAT_FILE, buf);
+  mark("s4", "ok", `알갱이로 풀기: ${kb(n)}개`);
+  $("stats").textContent = `파일 ${kb(buf.byteLength)}바이트 · 받기 ${sec.toFixed(1)}초 · 알갱이 ${kb(n)}개`;
+  addRow(SPLAT_FILE, buf.byteLength, n, dsec);
+  fit();
+} catch (e) {
+  if ($("s3").className !== "ok") mark("s3", "bad"); else mark("s4", "bad");
+  fail(`"${SPLAT_FILE}"를 열지 못했습니다: ${e.message}\n` +
+    "1. 파일이 같은 폴더에 있나(철자·대소문자)\n2. file://로 열지 않았나 → python -m http.server\n3. 주소 뒤에 /" + SPLAT_FILE + "를 붙여 직접 내려받아지나");
+}
+
+// 파일 끌어다 놓기·고르기로 형식 비교
+async function compare(files) {
+  for (const f of files) {
+    try {
+      const { n, sec } = await show(f.name, await f.arrayBuffer());
+      addRow(f.name, f.size, n, sec);
+      fit();
+    } catch (e) { fail(`${f.name}: ${e.message}`); }
+  }
+}
+addEventListener("dragover", e => { e.preventDefault(); $("drop").classList.add("show"); });
+addEventListener("dragleave", () => $("drop").classList.remove("show"));
+addEventListener("drop", e => { e.preventDefault(); $("drop").classList.remove("show"); compare([...e.dataTransfer.files]); });
+$("pick").onclick = () => $("file").click();
+$("file").onchange = e => compare([...e.target.files]);
+
+$("fit").onclick = fit;
+$("flip").onclick = () => { if (!mesh) return; mesh.scale.y *= -1; mesh.scale.z *= -1; mesh.updateMatrixWorld(true); fit(); };
+$("spin").onclick = e => {
+  controls.autoRotate = !controls.autoRotate; controls.autoRotateSpeed = 0.6;
+  e.target.classList.toggle("on", controls.autoRotate); e.target.setAttribute("aria-pressed", String(controls.autoRotate));
+};
+
+(function loop() { requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+</script>
+</body>
+</html>

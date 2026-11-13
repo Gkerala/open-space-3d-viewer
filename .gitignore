@@ -1,0 +1,16 @@
+# 원본과 중간 산출물은 로컬에만 둔다 (README에 측정값만 적는다)
+raw/
+frames/
+*.mp4
+*.mov
+*.npz
+*.ply
+*.spz
+# 에이전트 설정
+.claude/
+.mcp.json
+.venv/
+colab_upload.zip
+colab_t4.ipynb
+out/
+__pycache__/
